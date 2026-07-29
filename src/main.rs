@@ -5,13 +5,19 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use anyhow::Result;
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::{
-    sync::{RwLock, oneshot},
+    net::TcpStream,
+    sync::{Mutex, RwLock, oneshot},
     time::sleep,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 // TODO: look at `which` crate
 const CHROMIUM_PATH: &str = "/usr/local/bin/chromium";
@@ -28,38 +34,108 @@ struct Target {
     web_socket_debugger_url: String,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct WsCommand {
-    id: u32,
-    method: String,
-    params: serde_json::Value,
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(untagged)]
+enum WsResponse {
+    Response { id: u32, result: Value },
+    Event { method: String, params: Value },
 }
 
-impl WsCommand {
-    fn new(method: &str) -> Self {
-        WsCommand {
-            id: COMMAND_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            method: method.to_string(),
-            params: serde_json::Value::Null,
+type CommandMap = HashMap<u32, oneshot::Sender<WsResponse>>;
+
+#[derive(Debug)]
+struct CdpClient {
+    sink: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+    pending: Arc<RwLock<CommandMap>>,
+    next_id: Arc<AtomicU32>,
+}
+
+impl CdpClient {
+    async fn connect(ws_url: &str) -> Result<Self> {
+        let (ws_stream, _) = connect_async(ws_url)
+            .await
+            .expect("Failed to connect to WebSocket");
+
+        let (sink, source) = ws_stream.split();
+
+        let pending = Arc::new(RwLock::new(CommandMap::new()));
+
+        let pending_for_reader = pending.clone();
+
+        let client = Self {
+            next_id: Arc::new(AtomicU32::new(1)),
+            sink: Arc::new(Mutex::new(sink)),
+            pending,
+        };
+        tokio::spawn(event_reader(source, pending_for_reader));
+
+        Ok(client)
+    }
+
+    async fn send_message(&self, method: &str, params: Option<Value>) -> Result<WsResponse> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let message = Message::text(
+            json!({
+                "id": id,
+                "method": method,
+                "params": params
+            })
+            .to_string(),
+        );
+
+        // Wait for the response
+        let (tx, rx) = oneshot::channel::<WsResponse>();
+        self.pending.write().await.insert(id, tx);
+
+        let mut sink = self.sink.lock().await;
+        sink.send(message).await?;
+        drop(sink); // Release the lock before awaiting the response
+
+        let response = rx.await?;
+        Ok(response)
+    }
+}
+
+async fn event_reader(
+    mut source: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    pending_for_reader: Arc<RwLock<CommandMap>>,
+) {
+    loop {
+        let message = source
+            .next()
+            .await
+            .expect("WebSocket connection closed unexpectedly")
+            .expect("Failed to read message from WebSocket");
+
+        match message {
+            Message::Text(text) => {
+                let response: WsResponse =
+                    serde_json::from_str(&text).expect("Failed to parse WebSocket message");
+                match &response {
+                    WsResponse::Response { id, .. } => {
+                        pending_for_reader
+                            .write()
+                            .await
+                            .remove(&id)
+                            .map(|tx| tx.send(response));
+                    }
+                    WsResponse::Event { method, params } => {
+                        // TODO: handle events properly, related: broadcast channel
+                        println!("Received event: {} with params: {:?}", method, params);
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
-
-    fn with_params(mut self, params: serde_json::Value) -> Self {
-        self.params = params;
-        self
-    }
 }
-
-#[derive(Deserialize, Serialize, Debug)]
-struct WsResponse {
-    id: u32,
-    result: serde_json::Value,
-}
-
-static COMMAND_ID: AtomicU32 = AtomicU32::new(1);
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let chromium = Command::new(CHROMIUM_PATH)
         .args([
             "--headless",
@@ -79,68 +155,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: figure out a better way to wait for Chromium to be ready
     sleep(Duration::new(2, 0)).await;
 
-    let response = reqwest::get("http://localhost:9222/json")
+    let targets = reqwest::get("http://localhost:9222/json")
         .await?
         .json::<Vec<Target>>()
         .await?;
 
-    let (ws_stream, _) = connect_async(&response[0].web_socket_debugger_url)
+    let ws_url = &targets[0].web_socket_debugger_url;
+    let client = CdpClient::connect(ws_url).await?;
+
+    client
+        .send_message("Page.enable", None)
         .await
-        .expect("Failed to connect to WebSocket");
+        .expect("Failed to send command");
 
-    let (mut sink, mut _source) = ws_stream.split();
+    client
+        .send_message(
+            "Page.navigate",
+            Some(serde_json::json!({ "url": "https://www.example.com" })),
+        )
+        .await
+        .expect("Failed to send command");
 
-    let pending = Arc::new(RwLock::new(HashMap::<
-        u32,
-        oneshot::Sender<serde_json::Value>,
-    >::new()));
-    let pending_for_reader = pending.clone();
-
-    // Reader task to handle incoming messages from the WebSocket
-    tokio::spawn(async move {
-        while let Some(message) = _source.next().await {
-            match message {
-                Ok(Message::Text(text)) => {
-                    println!("Received message: {:?}", text);
-
-                    // If the message is a response to a command, send it to the corresponding oneshot channel
-                    if let Ok(response) = serde_json::from_str::<WsResponse>(&text) {
-                        pending_for_reader
-                            .write()
-                            .await
-                            .remove(&response.id)
-                            .map(|tx| tx.send(response.result));
-                    }
-                }
-                Ok(Message::Close(_)) => break,
-                _ => {}
-            }
-        }
-    });
-
-    let mut send_command = async |command: WsCommand| -> serde_json::Value {
-        let pending = pending.clone();
-        let json = serde_json::to_string(&command).expect("Failed to serialize command");
-        let message = Message::text(json);
-        sink.send(message).await.expect("Failed to send command");
-
-        // Wait for the response
-        let (tx, rx) = oneshot::channel::<serde_json::Value>();
-        pending.write().await.insert(command.id, tx);
-        let response = rx.await.expect("Failed to receive response");
-        response
-    };
-
-    send_command(WsCommand::new("Page.enable"))
-        .then(|res| async move { println!("Response from Page.enable: {:?}", res) })
-        .await;
-
-    send_command(
-        WsCommand::new("Page.navigate")
-            .with_params(serde_json::json!({ "url": "https://www.example.com" })),
-    )
-    .then(|res| async move { println!("Response from Page.navigate: {:?}", res) })
-    .await;
+    // TODO: add a `goto` method to `CdpClient` that wraps `send_message`
+    // it should wait for the `Page.loadEventFired` event before returning
 
     tokio::signal::ctrl_c().await.unwrap();
 
