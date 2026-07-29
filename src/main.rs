@@ -142,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .then(|res| async move { println!("Response from Page.navigate: {:?}", res) })
     .await;
 
-    sleep(Duration::new(5, 0)).await;
+    tokio::signal::ctrl_c().await.unwrap();
 
     Ok(())
 }
