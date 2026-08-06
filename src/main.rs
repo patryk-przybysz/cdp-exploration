@@ -257,7 +257,9 @@ async fn main() -> Result<()> {
         .result
         .get("targetId")
         .unwrap()
-        .to_string();
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     println!("Created target with ID: {}", target_id);
     // TODO: capture the `Target.attachedToTarget` event and extract the `sessionId` from it
