@@ -1,4 +1,4 @@
-FROM ghcr.io/philips-software/amp-devcontainer-rust:8.0.1
+FROM ghcr.io/philips-software/amp-devcontainer-rust:8.1.0
 
 # Chromium system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
